@@ -23,7 +23,6 @@ const (
 	IDLE       TaskState = 0
 	INPROGRESS TaskState = 1
 	COMPLETED  TaskState = 2
-	TIMEOUT    TaskState = 3
 )
 
 type Task struct {
@@ -58,7 +57,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		}
 		taskNum := task.TaskNum
 		c.latch.Lock()
-		if task.TaskType == TaskType(c.stage) && c.metaTable[taskNum].state != COMPLETED {
+		if task.TaskType == TaskType(c.stage) && c.metaTable[taskNum].state == IDLE {
 			c.metaTable[taskNum].state = INPROGRESS
 			c.metaTable[taskNum].startTime = time.Now()
 			c.latch.Unlock()
@@ -83,7 +82,7 @@ func (c *Coordinator) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) e
 	}
 	taskNum := args.TaskNum
 	table := c.metaTable
-	if args.TaskType == TaskType(c.stage) && (table[taskNum].state == INPROGRESS || table[taskNum].state == TIMEOUT) {
+	if args.TaskType == TaskType(c.stage) && (table[taskNum].state != COMPLETED) {
 		table[taskNum].state = COMPLETED
 		c.dones <- true
 	}
@@ -159,16 +158,17 @@ func (c *Coordinator) execute(stage int) {
 func (c *Coordinator) timeOutDetection() {
 	for {
 		time.Sleep(time.Second)
-		if c.Done() {
+		c.latch.Lock()
+		if c.stage == int(Done) {
+			c.latch.Unlock()
 			break
 		}
-		c.latch.Lock()
 		table := c.metaTable
 		timeOutTasks := []*Task{}
 		for i, item := range table {
 			if item.state == INPROGRESS && time.Since(item.startTime).Seconds() > 10 {
 				timeOutTasks = append(timeOutTasks, item.task)
-				table[i].state = TIMEOUT
+				table[i].state = IDLE
 			}
 		}
 		c.latch.Unlock()
