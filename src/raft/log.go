@@ -29,7 +29,7 @@ func toString(entries []LogEntry) string {
 func (rf *Raft) rangeCheck(index int) {
 	length := len(rf.log)
 	if index < 0 || index > length {
-		Fatalf("IndexOutOfBounds: Index: %d, Length: %d", index, length)
+		Fatalf("S%d : IndexOutOfBounds<Index: %d, Length: %d>", rf.me, index, length)
 	}
 }
 

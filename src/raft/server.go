@@ -1,5 +1,9 @@
 package raft
 
+func (rf *Raft) IsUpToDateTermL(term int) bool {
+	return rf.currentTerm <= term
+}
+
 func (rf *Raft) UpdateMatchIndexL(peer int, newMatch int) bool {
 	if newMatch > rf.matchIndex[peer] {
 		rf.matchIndex[peer] = newMatch
@@ -20,6 +24,7 @@ func (rf *Raft) UpdateCommitIndexL(index int) {
 func (rf *Raft) UpdateTermL(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
+	rf.persist()
 	if rf.state != Follower {
 		rf.ConvertStateL(Follower)
 	}
@@ -36,7 +41,10 @@ func (rf *Raft) appendLogsL(startIndex int, entries []LogEntry) {
 			break
 		}
 	}
-	rf.log = append(rf.log[:conflictIndex], entries[entriesIdx:]...)
+	if entriesIdx < entriesLength {
+		rf.log = append(rf.log[:conflictIndex], entries[entriesIdx:]...)
+		rf.persist()
+	}
 }
 
 func (rf *Raft) ConvertStateL(state RaftState) {
@@ -44,16 +52,17 @@ func (rf *Raft) ConvertStateL(state RaftState) {
 	rf.state = state
 	switch state {
 	case Follower:
-		DPrintf("S%d : Convert To Follower", rf.me)
+		//DPrintf("S%d : Convert To Follower", rf.me)
 		if currentState == Leader {
 			rf.StopHeartBeatTimer()
 			rf.ResetElectionTimer()
 		}
 	case Candidate:
-		DPrintf("S%d : Convert To Candidate", rf.me)
+		//DPrintf("S%d : Convert To Candidate", rf.me)
 		rf.ResetElectionTimer()
 		rf.currentTerm++
 		rf.votedFor = rf.me
+		rf.persist()
 		rf.requestVoteToPeersL()
 	case Leader:
 		DPrintf("S%d : Convert To Leader, Term = %d", rf.me, rf.currentTerm)
@@ -64,7 +73,7 @@ func (rf *Raft) ConvertStateL(state RaftState) {
 			rf.inFlightIndex[i] = 0
 		}
 		rf.ResetHeartBeatTimer()
-		rf.appendEntriesToPeersL(true)
+		rf.appendEntriesToPeers(true)
 	}
 }
 
@@ -75,28 +84,37 @@ func (rf *Raft) requestVoteToPeersL() {
 	args := &RequestVoteArgs{rf.currentTerm, rf.me, lastLogIndex, lastLogTerm}
 	for i := range rf.peers {
 		if i != rf.me {
-			DPrintf("RV Request: S%d -> S%d,Term = %d", rf.me, i, rf.currentTerm)
+			//DPrintf("RV Request: S%d -> S%d,Term = %d", rf.me, i, rf.currentTerm)
 			go rf.sendRequestVote(i, args, &votes)
 		}
 	}
 }
 
-func (rf *Raft) appendEntriesToPeersL(isHeartBeat bool) {
+func (rf *Raft) appendEntriesToPeers(isHeartBeat bool) {
 	for i := range rf.peers {
 		if i != rf.me {
-			length := len(rf.log)
-			if rf.state != Leader || (length <= rf.inFlightIndex[i] && !isHeartBeat) {
-				continue
-			}
-			var entries []LogEntry
-			prevLogIndex := rf.nextIndex[i] - 1
-			prevLogTerm := rf.get(prevLogIndex).Term
-			entries = make([]LogEntry, length-prevLogIndex)
-			copy(entries, rf.log[prevLogIndex:])
-			rf.inFlightIndex[i] = prevLogIndex + len(entries)
-			args := &AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
-			DPrintf("AE Request: S%d -> S%d,isHeartBeat = %t,Term = %d,prevLogIndex = %d,prevLogTerm = %d,LeaderCommit = %d,entries = {%s}", args.LeaderId, i, isHeartBeat, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, toString(args.Entries))
-			go rf.sendAppendEntries(i, args)
+			go func(peer int, isHeartBeat bool) {
+				rf.mu.Lock()
+				length := len(rf.log)
+				if rf.persistIndex < length {
+					rf.persistIndex = length
+					rf.persist()
+				}
+				if rf.state != Leader || (length <= rf.inFlightIndex[peer] && !isHeartBeat) {
+					rf.mu.Unlock()
+					return
+				}
+				var entries []LogEntry
+				prevLogIndex := rf.nextIndex[peer] - 1
+				prevLogTerm := rf.get(prevLogIndex).Term
+				entries = make([]LogEntry, length-prevLogIndex)
+				copy(entries, rf.log[prevLogIndex:])
+				rf.inFlightIndex[peer] = prevLogIndex + len(entries)
+				args := &AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
+				rf.mu.Unlock()
+				DPrintf("AE Request: S%d -> S%d,isHeartBeat = %t,Term = %d,prevLogIndex = %d,prevLogTerm = %d,LeaderCommit = %d,entries = {%s}", args.LeaderId, peer, isHeartBeat, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, toString(args.Entries))
+				rf.sendAppendEntries(peer, args)
+			}(i, isHeartBeat)
 		}
 	}
 }
@@ -118,7 +136,7 @@ func (rf *Raft) commitLogL() {
 			}
 			if matches > peerNums/2 {
 				rf.UpdateCommitIndexL(idx)
-				//DPrintf("S%d : commitLog, commitIndex = %d", rf.me, rf.commitIndex)
+				DPrintf("S%d : CommitLog, currentTerm = %d,commitIndex = %d, commitTerm = %d", rf.me, rf.currentTerm, rf.commitIndex, rf.log[rf.commitIndex-1])
 				break
 			}
 		}

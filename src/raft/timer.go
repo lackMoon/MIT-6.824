@@ -48,7 +48,7 @@ func (rf *Raft) ticker() {
 		case <-rf.heartBeatTimer.C:
 			rf.mu.Lock()
 			rf.ResetHeartBeatTimer()
-			rf.appendEntriesToPeersL(true)
+			rf.appendEntriesToPeers(true)
 			rf.mu.Unlock()
 		}
 	}
