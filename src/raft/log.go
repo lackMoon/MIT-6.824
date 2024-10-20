@@ -26,18 +26,26 @@ func toString(entries []LogEntry) string {
 	return s
 }
 
+func (rf *Raft) ToLogIndex(index int) int {
+	if index < rf.logStart {
+		return -1
+	}
+	return index - rf.logStart
+}
+
 func (rf *Raft) rangeCheck(index int) {
-	length := len(rf.log)
-	if index < 0 || index > length {
-		Fatalf("S%d : IndexOutOfBounds<Index: %d, Length: %d>", rf.me, index, length)
+	size := rf.size()
+	if index < 0 || index > size {
+		Fatalf("S%d : IndexOutOfBounds<Index: %d, Size: %d>", rf.me, index, size)
 	}
 }
 
 func (rf *Raft) get(index int) LogEntry {
-	resultEntry := LogEntry{0, nil}
+	resultEntry := LogEntry{rf.snapShot.SnapshotTerm, nil}
 	rf.rangeCheck(index)
-	if index != 0 {
-		resultEntry = rf.log[index-1]
+	logIndex := rf.ToLogIndex(index)
+	if logIndex != -1 {
+		resultEntry = rf.log[logIndex]
 	}
 	return resultEntry
 }
@@ -47,7 +55,7 @@ func (rf *Raft) get(index int) LogEntry {
 func (rf *Raft) indexOf(term int) int {
 	for i, entry := range rf.log {
 		if entry.Term == term {
-			return i + 1
+			return i + rf.logStart
 		}
 	}
 	return 0
@@ -56,11 +64,15 @@ func (rf *Raft) indexOf(term int) int {
 // Returns the index of the last occurrence of the specified term in log entries,
 // or 0 if log does not contain this term.
 func (rf *Raft) lastIndexOf(term int) int {
-	length := len(rf.log)
-	for i := length - 1; i >= 0; i-- {
+	end := len(rf.log) - 1
+	for i := end; i >= 0; i-- {
 		if rf.log[i].Term == term {
-			return i + 1
+			return i + rf.logStart
 		}
 	}
 	return 0
+}
+
+func (rf *Raft) size() int {
+	return len(rf.log) + rf.logStart - 1
 }

@@ -40,6 +40,12 @@ const (
 
 const RaftHeartBeatInterval = 100 * time.Millisecond
 
+type RaftSnapShot struct {
+	Snapshot      []byte
+	SnapshotIndex int
+	SnapshotTerm  int
+}
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -77,15 +83,20 @@ type Raft struct {
 	heartBeatTimer *time.Timer
 	currentTerm    int
 	votedFor       int
-	log            []LogEntry
 	commitIndex    int
 	lastApplied    int
 	nextIndex      []int
 	matchIndex     []int
-	inFlightIndex  []int //Reduce nums of repeat AE RPCs
-	persistIndex   int
+	log            []LogEntry
+	logStart       int
+	snapShot       RaftSnapShot
 	ToApply        *sync.Cond
 	applyCh        chan ApplyMsg
+	applySnapShot  bool
+	//state for performance
+	inFlightIndex         []int //Reduce nums of repeated AE RPCs
+	inFlightSnapShotIndex []int //Reduce nums of repeated ISS RPCs
+	persistIndex          int
 }
 
 // return currentTerm and whether this server
@@ -107,8 +118,11 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.logStart)
+	e.Encode(rf.snapShot.SnapshotIndex)
+	e.Encode(rf.snapShot.SnapshotTerm)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.snapShot.Snapshot)
 }
 
 // restore previously persisted state.
@@ -116,20 +130,36 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var logStart int
+	var snapshotIndex int
+	var snapshotTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&logStart) != nil ||
+		d.Decode(&snapshotIndex) != nil ||
+		d.Decode(&snapshotTerm) != nil {
 		Fatalf("S%d : read Persisted State Failed", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.logStart = logStart
+		if snapshotIndex > 0 && snapshotTerm > 0 && rf.persister.SnapshotSize() > 0 {
+			rf.snapShot = RaftSnapShot{rf.persister.ReadSnapshot(), snapshotIndex, snapshotTerm}
+			if snapshotIndex > logStart {
+				rf.log = append([]LogEntry{}, rf.log[rf.ToLogIndex(snapshotIndex)+1:]...)
+				rf.logStart = snapshotIndex + 1
+			}
+			rf.commitIndex = snapshotIndex
+			rf.applySnapShot = true
+			rf.ToApply.Broadcast()
+		}
 	}
 }
 
@@ -148,7 +178,20 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index > rf.commitIndex || index <= rf.logStart {
+		return
+	}
+	rf.snapShot = RaftSnapShot{snapshot, index, rf.get(index).Term}
+	rf.log = append([]LogEntry{}, rf.log[rf.ToLogIndex(index)+1:]...)
+	rf.logStart = index + 1
+	rf.persist()
+	if rf.lastApplied+1 < index {
+		rf.applySnapShot = true
+		rf.ToApply.Broadcast()
+	}
+	DPrintf("S%d : Make SnapShot, Index = %d, Log = {%s}", rf.me, index, toString(rf.log))
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -170,9 +213,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state == Leader {
 		entry := LogEntry{rf.currentTerm, command}
 		rf.log = append(rf.log, entry)
-		index = len(rf.log)
+		index = rf.size()
 		isLeader = true
-		rf.appendEntriesToPeers(false)
+		rf.sendRPCToPeers(false)
 		DPrintf("S%d : Receive Command from client, Term = %d, Index = %d", rf.me, rf.currentTerm, index)
 	}
 	return index, term, isLeader
@@ -222,9 +265,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.state = Follower
 
+	rf.logStart = 1
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.inFlightIndex = make([]int, len(peers))
+	rf.inFlightSnapShotIndex = make([]int, len(peers))
 	rf.persistIndex = 0
 	rf.electionTimer = time.NewTimer(time.Duration(500+rand.Int63()%300) * time.Millisecond)
 	rf.heartBeatTimer = time.NewTimer(RaftHeartBeatInterval)
@@ -245,17 +290,33 @@ func (rf *Raft) applier() {
 	defer rf.mu.Unlock()
 	for !rf.killed() {
 		rf.ToApply.Wait()
-		applyMsg := ApplyMsg{}
-		for i := rf.lastApplied; i < rf.commitIndex; i++ {
-			idx := i + 1
-			applyMsg.CommandValid = true
-			applyMsg.Command = rf.log[i].Command
-			applyMsg.CommandIndex = idx
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			//DPrintf("S%d : Apply Log,Index = %d", rf.me, idx)
-			rf.mu.Lock()
+		for rf.lastApplied < rf.commitIndex {
+			if rf.applySnapShot {
+				applyMsg := ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      rf.snapShot.Snapshot,
+					SnapshotIndex: rf.snapShot.SnapshotIndex,
+					SnapshotTerm:  rf.snapShot.SnapshotTerm,
+				}
+				rf.applySnapShot = false
+				rf.lastApplied = rf.snapShot.SnapshotIndex
+				DPrintf("S%d : Apply SnapShot,LastIncludeIndex = %d, LastIncludeTerm = %d", rf.me, applyMsg.SnapshotIndex, applyMsg.SnapshotTerm)
+				rf.mu.Unlock()
+				rf.applyCh <- applyMsg
+				rf.mu.Lock()
+			} else {
+				idx := rf.lastApplied + 1
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.get(idx).Command,
+					CommandIndex: idx,
+				}
+				rf.lastApplied++
+				//DPrintf("S%d : Apply Log,Index = %d", rf.me, idx)
+				rf.mu.Unlock()
+				rf.applyCh <- applyMsg
+				rf.mu.Lock()
+			}
 		}
-		rf.lastApplied = rf.commitIndex
 	}
 }
